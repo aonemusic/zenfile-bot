@@ -60,6 +60,17 @@ async def on_error(update: object, context) -> None:
             pass
 
 
+class RootHandler(tornado.web.RequestHandler):
+    """Lightweight root response for Render's initial port probe."""
+
+    def get(self) -> None:
+        self.finish("ZENFILE service online; readiness: /healthz")
+
+    def head(self) -> None:
+        self.set_status(200)
+        self.finish()
+
+
 class HealthHandler(tornado.web.RequestHandler):
     """Render health endpoint; readiness is true only after Telegram accepts the webhook."""
 
@@ -105,6 +116,7 @@ async def run_webhook_server(application: Application, stop_event: asyncio.Event
     ready_state = {"ready": False}
     webhook_route = rf"/{re.escape(settings.webhook_path)}/?"
     web_app = tornado.web.Application([
+        (r"/", RootHandler),
         (r"/healthz/?", HealthHandler, {"ready_state": ready_state}),
         (webhook_route, TelegramWebhookHandler, {
             "bot": application.bot,

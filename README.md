@@ -199,7 +199,7 @@ Render's free Web Service may sleep when idle and can delay webhook handling whi
 
 ## Test the project
 
-After installing `requirements.txt`, run `python -m pytest -q` from the repository root. Tests that depend on optional system binaries skip when those tools are absent. A passing local suite does not guarantee every codec/filter on a different deployment host. On Render, `/healthz` returns 200 only after the webhook has registered successfully; the webhook listener binds before making Telegram API calls so Render can detect the port during startup.
+After installing `requirements.txt`, run `python -m pytest -q` from the repository root. Tests that depend on optional system binaries skip when those tools are absent. A passing local suite does not guarantee every codec/filter on a different deployment host. On Render, the root route answers 200 to startup probes, and `/healthz` returns 200 only after the webhook registers successfully; the listener binds before making Telegram API calls.
 
 ## Launch checklist
 

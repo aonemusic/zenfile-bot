@@ -9,7 +9,7 @@ from tornado.testing import AsyncHTTPTestCase
 
 import bot as bot_module
 from config import settings
-from bot import HealthHandler, TelegramWebhookHandler
+from bot import HealthHandler, RootHandler, TelegramWebhookHandler
 
 
 class WebhookHandlerTests(AsyncHTTPTestCase):
@@ -18,6 +18,7 @@ class WebhookHandlerTests(AsyncHTTPTestCase):
         self.update_queue = asyncio.Queue()
         self.bot = Bot("123456:TESTTOKEN")
         return tornado.web.Application([
+            (r"/", RootHandler),
             (r"/healthz/?", HealthHandler, {"ready_state": self.ready_state}),
             (r"/test-webhook/?", TelegramWebhookHandler, {
                 "bot": self.bot,
@@ -30,6 +31,9 @@ class WebhookHandlerTests(AsyncHTTPTestCase):
         self.assertEqual(self.fetch("/healthz").code, 503)
         self.ready_state["ready"] = True
         self.assertEqual(self.fetch("/healthz").code, 200)
+
+    def test_root_head_probe_returns_success(self):
+        self.assertEqual(self.fetch("/", method="HEAD").code, 200)
 
     def test_webhook_rejects_wrong_secret(self):
         response = self.fetch(
@@ -84,6 +88,12 @@ def test_listener_is_open_before_webhook_registration(monkeypatch, tmp_path):
         async def set_webhook(self, **kwargs):
             self.webhook_kwargs = kwargs
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            self.root_status = (await reader.readline()).decode().strip()
+            writer.close()
+            await writer.wait_closed()
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
             writer.write(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             await writer.drain()
             self.health_status = (await reader.readline()).decode().strip()
@@ -113,9 +123,10 @@ def test_listener_is_open_before_webhook_registration(monkeypatch, tmp_path):
         stop_event = asyncio.Event()
         app = FakeApplication()
         await bot_module.run_webhook_server(app, stop_event)
-        return app.bot.health_status, app.bot.webhook_kwargs
+        return app.bot.root_status, app.bot.health_status, app.bot.webhook_kwargs
 
     stop_event = None
-    health_status, webhook_kwargs = asyncio.run(run_test())
+    root_status, health_status, webhook_kwargs = asyncio.run(run_test())
+    assert root_status.startswith("HTTP/1.1 200")
     assert health_status.startswith("HTTP/1.1 503")
     assert webhook_kwargs["url"] == "https://example.test/test-webhook"

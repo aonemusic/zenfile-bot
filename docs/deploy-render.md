@@ -1,6 +1,6 @@
 # Deploy ZENFILE on Render
 
-The included [`render.yaml`](../render.yaml) describes a Docker Web Service using Telegram webhooks. It binds to Render's injected `PORT`; the app uses `RENDER_EXTERNAL_URL` as the webhook base URL if `WEBHOOK_URL` is unset. Local unit/conversion tests have been run, but the image and webhook deployment must still be validated in Render.
+The included [`render.yaml`](../render.yaml) describes a Docker Web Service using Telegram webhooks. It binds to Render's injected `PORT`; the app uses `RENDER_EXTERNAL_URL` as the webhook base URL if `WEBHOOK_URL` is unset. The HTTP listener opens before Telegram API setup. `/` returns 200 for the initial platform probe, while `/healthz` returns 200 only after Telegram accepts the webhook. Local unit/conversion tests have been run, but each Render deployment must still be validated in Render.
 
 ## 1. Prepare the GitHub repository
 
@@ -26,7 +26,7 @@ The included [`render.yaml`](../render.yaml) describes a Docker Web Service usin
 1. Sign in to Render and connect the GitHub account/repository containing ZENFILE.
 2. Create or update the Render service as a Docker **Web Service** using `Dockerfile`. The included Blueprint declares `type: web` and `plan: free` to match the intended setup; confirm the current price and free-tier limits in your account.
 3. Add `BOT_TOKEN` and `WEBHOOK_SECRET` as private environment variables. `WEBHOOK_URL` may be left unset because the app uses Render's `RENDER_EXTERNAL_URL`; set `WEBHOOK_PATH=zenfile-webhook` if it is not already configured.
-4. Set `BOT_MODE=webhook`. Keep Render's injected `PORT` unchanged; the app binds the Tornado webhook server to it. Set `ADMIN_ID` only to one verified numeric Telegram user ID if admin commands are needed.
+4. Set `BOT_MODE=webhook`. Keep Render's injected `PORT` unchanged; the app binds its HTTP server to `0.0.0.0:$PORT` before making Telegram API calls. The Blueprint uses `/healthz` for readiness; for a manually configured service, select `/healthz` under **Settings → Health Checks** if you want HTTP readiness checks. The root route also returns 200 for generic startup probes.
 5. Review the defaults: `MAX_INPUT_MB=18`, `MAX_OUTPUT_MB=49`, `MAX_CONCURRENT_JOBS=2`, and `JOB_TIMEOUT_SECONDS=300`.
 6. Deploy and inspect build and application logs. Do not run polling and webhook delivery at once for the same token.
 
@@ -39,7 +39,7 @@ The included [`render.yaml`](../render.yaml) describes a Docker Web Service usin
 
 ## Polling versus webhook
 
-This Web Service must use `BOT_MODE=webhook`. It binds to Render's `PORT` and uses `WEBHOOK_URL` or `RENDER_EXTERNAL_URL` plus `WEBHOOK_PATH` to register the webhook with Telegram. Set a strong `WEBHOOK_SECRET`. Do not run a second polling process for the same bot token. Render's free Web Services may sleep when idle, so webhook delivery can experience cold-start delays; check the current plan behavior and costs before relying on uninterrupted availability.
+This Web Service must use `BOT_MODE=webhook`. It binds to Render's `PORT` and uses `WEBHOOK_URL` or `RENDER_EXTERNAL_URL` plus `WEBHOOK_PATH` to register the webhook with Telegram. Set a strong `WEBHOOK_SECRET`. Do not run a second polling process for the same bot token. Render requires Web Services to listen on `0.0.0.0` and the configured port; its default is `10000` ([port binding](https://render.com/docs/web-services#port-binding)). A port-scan timeout can fail a deploy when the app does not bind in time ([troubleshooting](https://render.com/docs/troubleshooting-deploys#port-scan-timeout-reached)). Render's free Web Services may sleep when idle, so webhook delivery can experience cold-start delays; check the current plan behavior and costs before relying on uninterrupted availability.
 
 ## Operations and caveats
 
