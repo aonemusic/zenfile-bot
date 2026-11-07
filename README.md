@@ -131,7 +131,7 @@ The container runs as a non-root user and is intended for one bot process. Tempo
 - [Render deployment](docs/deploy-render.md) — Docker Web Service configured for Telegram webhooks.
 - [Koyeb deployment](docs/deploy-koyeb.md) — Docker worker/service instructions and environment setup.
 
-A continuously running worker may incur hosting charges. Free hosting tiers can sleep, pause, or scale to zero, and their resource limits vary; they do **not** guarantee 24/7 bot availability. Sleeping/restarting services can delay update handling or interrupt conversion jobs. Confirm current plan behavior, quotas, persistence, and pricing directly with the provider before deployment.
+Render's free Web Service may sleep when idle and can delay webhook handling while it wakes. Free hosting tiers can pause or scale to zero and do **not** guarantee 24/7 bot availability. Restarts can interrupt conversion jobs. Confirm current plan behavior, quotas, persistence, and pricing directly with the provider before deployment.
 
 ## Temporary files, privacy, and operational security
 
@@ -182,6 +182,7 @@ A continuously running worker may incur hosting charges. Free hosting tiers can 
 │   ├── test_cleanup.py
 │   ├── test_admin.py
 │   ├── test_sessions.py
+│   ├── test_webhook.py
 │   └── test_bot_ui.py
 ├── .dockerignore
 ├── .env.example
@@ -198,7 +199,7 @@ A continuously running worker may incur hosting charges. Free hosting tiers can 
 
 ## Test the project
 
-After installing `requirements.txt`, run `python -m pytest -q` from the repository root. Tests that depend on optional system binaries skip when those tools are absent. A passing local suite does not guarantee every codec/filter on a different deployment host.
+After installing `requirements.txt`, run `python -m pytest -q` from the repository root. Tests that depend on optional system binaries skip when those tools are absent. A passing local suite does not guarantee every codec/filter on a different deployment host. On Render, `/healthz` returns 200 only after the webhook has registered successfully; the webhook listener binds before making Telegram API calls so Render can detect the port during startup.
 
 ## Launch checklist
 

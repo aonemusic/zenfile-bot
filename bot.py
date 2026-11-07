@@ -1,10 +1,17 @@
 """ZENFILE Telegram bot entry point. Run with: python bot.py"""
 from __future__ import annotations
 import asyncio
+import hmac
+import json
 import logging
+import re
+import signal
 import shutil
 import sys
 from pathlib import Path
+
+import tornado.httpserver
+import tornado.web
 
 from telegram import Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
@@ -53,6 +60,97 @@ async def on_error(update: object, context) -> None:
             pass
 
 
+class HealthHandler(tornado.web.RequestHandler):
+    """Render health endpoint; readiness is true only after Telegram accepts the webhook."""
+
+    def initialize(self, ready_state: dict[str, bool]) -> None:
+        self.ready_state = ready_state
+
+    def get(self) -> None:
+        if not self.ready_state.get("ready", False):
+            self.set_status(503)
+            self.finish("starting")
+            return
+        self.finish("ok")
+
+
+class TelegramWebhookHandler(tornado.web.RequestHandler):
+    """Validate Telegram's webhook secret and queue parsed updates for PTB."""
+
+    def initialize(self, bot, update_queue, secret_token: str | None) -> None:
+        self.bot = bot
+        self.update_queue = update_queue
+        self.secret_token = secret_token
+
+    async def post(self) -> None:
+        content_type = self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise tornado.web.HTTPError(415)
+        if self.secret_token:
+            received = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(received, self.secret_token):
+                raise tornado.web.HTTPError(403)
+        try:
+            payload = json.loads(self.request.body)
+            update = Update.de_json(payload, self.bot)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise tornado.web.HTTPError(400, reason="Invalid Telegram update") from exc
+        if update is not None:
+            await self.update_queue.put(update)
+        self.finish("ok")
+
+
+async def run_webhook_server(application: Application, stop_event: asyncio.Event | None = None) -> None:
+    """Listen on Render's public port before making outbound Telegram API calls."""
+    ready_state = {"ready": False}
+    webhook_route = rf"/{re.escape(settings.webhook_path)}/?"
+    web_app = tornado.web.Application([
+        (r"/healthz/?", HealthHandler, {"ready_state": ready_state}),
+        (webhook_route, TelegramWebhookHandler, {
+            "bot": application.bot,
+            "update_queue": application.update_queue,
+            "secret_token": settings.webhook_secret or None,
+        }),
+    ])
+    http_server = tornado.httpserver.HTTPServer(web_app, max_body_size=2 * 1024 * 1024)
+    http_server.listen(settings.webhook_port, address="0.0.0.0")
+    LOG.info("HTTP listener ready on 0.0.0.0:%s; health=/healthz", settings.webhook_port)
+
+    stop_event = stop_event or asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    initialized = False
+    started = False
+    try:
+        await application.initialize()
+        initialized = True
+        await post_init(application)
+        await application.start()
+        started = True
+        await application.bot.set_webhook(
+            url=f"{settings.webhook_url.rstrip('/')}/{settings.webhook_path}",
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            secret_token=settings.webhook_secret or None,
+        )
+        ready_state["ready"] = True
+        LOG.info("Telegram webhook registered; service is ready")
+        await stop_event.wait()
+    finally:
+        ready_state["ready"] = False
+        http_server.stop()
+        await http_server.close_all_connections()
+        if started:
+            await application.stop()
+        if initialized:
+            await application.shutdown()
+
+
 def build_application() -> Application:
     app = Application.builder().token(settings.bot_token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -94,10 +192,7 @@ def main() -> None:
         if not settings.webhook_url:
             LOG.error("WEBHOOK_URL is required when BOT_MODE=webhook")
             sys.exit(2)
-        app.run_webhook(listen="0.0.0.0", port=settings.webhook_port,
-                        url_path=settings.webhook_path, webhook_url=f"{settings.webhook_url.rstrip('/')}/{settings.webhook_path}",
-                        secret_token=settings.webhook_secret or None,
-                        allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        asyncio.run(run_webhook_server(app))
     else:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 

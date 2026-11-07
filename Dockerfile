@@ -36,4 +36,5 @@ COPY --chown=zenfile:zenfile . .
 USER zenfile
 
 # The application implementation (including bot.py) must be present at build time.
+EXPOSE 10000
 CMD ["python", "bot.py"]
