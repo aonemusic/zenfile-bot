@@ -16,6 +16,7 @@ The repository includes modular bot handlers, conversion modules, security utili
 - **Default update mode:** Telegram polling (`BOT_MODE=polling`)
 - **Secrets:** Supplied through environment variables, never committed to Git
 - **Bot tools:** Format conversion, image/audio/video/PDF compression actions, image resizing, PDF info/merge/split, static multi-image-to-PDF, archive create/extract, and file information
+- **Conversation UX:** Back and Main menu controls throughout tool flows, a typing indicator while handlers work, and replacement/removal of obsolete prompts and progress messages
 
 ## Telegram file-size limits
 
@@ -171,7 +172,8 @@ Render's free Web Service may sleep when idle and can delay webhook handling whi
 │   ├── cleanup.py
 │   ├── security.py
 │   ├── compatibility.py
-│   └── process.py
+│   ├── process.py
+│   └── chat_ui.py
 ├── tests/
 │   ├── test_pdf.py
 │   ├── test_images.py
@@ -183,7 +185,9 @@ Render's free Web Service may sleep when idle and can delay webhook handling whi
 │   ├── test_admin.py
 │   ├── test_sessions.py
 │   ├── test_webhook.py
-│   └── test_bot_ui.py
+│   ├── test_bot_ui.py
+│   ├── test_chat_ui.py
+│   └── test_navigation.py
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore

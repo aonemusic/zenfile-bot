@@ -21,9 +21,10 @@ from runtime import state
 from handlers.start import start, menu_callback
 from handlers.files import (receive_file, conversion_callback, cancel_callback,
                             pdf_callback, text_input, compression_callback,
-                            archive_callback, resize_callback)
+                            archive_callback, resize_callback, back_callback)
 from handlers.admin import admin_command, stats_command, status_command, broadcast_command
 from utils.cleanup import cleanup_stale_jobs
+from utils.chat_ui import reply_with_navigation, send_typing
 
 LOG = logging.getLogger("zenfile")
 
@@ -55,7 +56,8 @@ async def on_error(update: object, context) -> None:
     LOG.error("Unhandled update error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("Sorry, something went wrong while handling that request. Please try again or send /start.")
+            await send_typing(context.bot, update.effective_message.chat_id)
+            await reply_with_navigation(update.effective_message, "Sorry, something went wrong while handling that request. Please try again or send /start.")
         except Exception:
             pass
 
@@ -172,6 +174,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(back_callback, pattern=r"^nav:back$"))
     app.add_handler(CallbackQueryHandler(conversion_callback, pattern=r"^convert:"))
     app.add_handler(CallbackQueryHandler(pdf_callback, pattern=r"^pdf:"))
     app.add_handler(CallbackQueryHandler(compression_callback, pattern=r"^compress:"))

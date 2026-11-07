@@ -11,14 +11,17 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from telegram import InlineKeyboardButton as _TelegramInlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton as _TelegramInlineKeyboardButton, InlineKeyboardMarkup as _TelegramInlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config import settings
 from runtime import state
+from handlers.start import WELCOME, _edit_or_replace, main_keyboard
 from utils.file_detector import detect_file, supported_targets
 from utils.errors import ConversionError
 from utils.security import safe_filename
+from utils.chat_ui import (delete_message, navigation_keyboard,
+                           reply_with_navigation, typing_handler)
 from converters import (pdf_converter, image_converter, audio_converter,
                         video_converter, document_converter, archive_converter)
 
@@ -38,6 +41,69 @@ def InlineKeyboardButton(text: str, callback_data: str | None = None, **kwargs):
         else:
             kwargs["style"] = "primary"
     return _TelegramInlineKeyboardButton(text=text, callback_data=callback_data, **kwargs)
+
+
+def InlineKeyboardMarkup(inline_keyboard, **kwargs):
+    """Ensure every file-operation keyboard has a Back and Main menu row."""
+    rows = [list(row) for row in inline_keyboard]
+    callbacks = {button.callback_data for row in rows for button in row}
+    nav_row = []
+    if "nav:back" not in callbacks:
+        nav_row.append(InlineKeyboardButton("↩ Back", callback_data="nav:back"))
+    if "menu:home" not in callbacks:
+        nav_row.append(InlineKeyboardButton("⌂ Main menu", callback_data="menu:home"))
+    if nav_row:
+        rows.append(nav_row)
+    return _TelegramInlineKeyboardMarkup(rows, **kwargs)
+
+
+async def _reply(message, text: str, *args, **kwargs):
+    return await reply_with_navigation(message, text, *args, **kwargs)
+
+
+async def _clear_tracked_prompts(context: ContextTypes.DEFAULT_TYPE, session: dict, chat_id: int) -> None:
+    for key in ("prompt_message_id", "collection_prompt_message_id", "menu_message_id"):
+        message_id = session.pop(key, None)
+        await delete_message(context.bot, chat_id, message_id)
+
+
+async def _collection_reply(context: ContextTypes.DEFAULT_TYPE, message, session: dict, text: str, *args, **kwargs):
+    await delete_message(context.bot, message.chat_id, session.get("collection_prompt_message_id"))
+    sent = await _reply(message, text, *args, **kwargs)
+    session["collection_prompt_message_id"] = sent.message_id
+    return sent
+
+
+async def _show_file_menu(query, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
+    session.pop("mode", None)
+    session.pop("prompt_message_id", None)
+    session.pop("collection_prompt_message_id", None)
+    session["view"] = "file"
+    if query.message:
+        session["menu_message_id"] = query.message.message_id
+    await _edit_or_replace(query, context, session.get("menu_text", "Choose a file action."),
+                           session.get("menu_markup", navigation_keyboard()), "HTML")
+
+
+async def _edit_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session: dict, text: str,
+                       parse_mode: str | None = None) -> int:
+    markup = InlineKeyboardMarkup([])
+    message_id = session.get("prompt_message_id")
+    if message_id:
+        try:
+            kwargs = {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": markup}
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            await context.bot.edit_message_text(**kwargs)
+            return message_id
+        except Exception:
+            pass
+    kwargs = {"chat_id": chat_id, "text": text, "reply_markup": markup}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    sent = await context.bot.send_message(**kwargs)
+    session["prompt_message_id"] = sent.message_id
+    return sent.message_id
 
 
 def _get_attachment(message):
@@ -151,6 +217,7 @@ def _format_size(size: int) -> str:
     return f"{size / (1024 * 1024):.2f} MB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KB"
 
 
+@typing_handler
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, user = update.effective_message, update.effective_user
     if not message or not user:
@@ -162,18 +229,23 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     max_bytes = settings.max_input_mb * 1024 * 1024
     size = getattr(attachment, "file_size", None)
     if size is not None and size > max_bytes:
-        await message.reply_text(f"This file exceeds the configured {settings.max_input_mb} MB input limit. The standard Telegram Bot API download limit for bots is about 20 MB.")
+        current = state.sessions.get(user.id)
+        text = f"This file exceeds the configured {settings.max_input_mb} MB input limit. The standard Telegram Bot API download limit for bots is about 20 MB."
+        if current and current.get("mode") in {"merge_collect", "zip_collect", "image_pdf_collect"}:
+            await _collection_reply(context, message, current, text)
+        else:
+            await _reply(message, text)
         return
 
     # PDF merge collection accepts only subsequent verified PDFs into the same private job.
     current = state.sessions.get(user.id)
     collection_mode = current.get("mode") if current and current.get("mode") in {"merge_collect", "zip_collect", "image_pdf_collect"} else None
     is_collection_add = bool(collection_mode)
-    is_merge_add = collection_mode == "merge_collect"
     if is_collection_add:
         job_dir = Path(current["job_dir"])
     else:
         if current:
+            await _clear_tracked_prompts(context, current, current.get("chat_id", user.id))
             shutil.rmtree(current.get("job_dir", ""), ignore_errors=True)
         settings.temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=settings.temp_dir))
@@ -193,7 +265,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if is_collection_add:
             if collection_mode == "merge_collect" and file_format != "pdf":
                 input_path.unlink(missing_ok=True)
-                await message.reply_text("PDF merge accepts only verified PDF files. Send another PDF or finish the merge.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Finish merge", callback_data="pdf:merge_finish")]]))
+                await _collection_reply(context, message, current, "PDF merge accepts only verified PDF files. Send another PDF or finish the merge.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Finish merge", callback_data="pdf:merge_finish")]]))
                 return
             if collection_mode == "image_pdf_collect":
                 try:
@@ -202,11 +274,11 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     img_meta = {}
                 if detected.category != "image" or img_meta.get("animated"):
                     input_path.unlink(missing_ok=True)
-                    await message.reply_text("Add only supported static images. Animated/multi-frame images are rejected to avoid dropping frames.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Create PDF", callback_data="pdf:image_finish")]]))
+                    await _collection_reply(context, message, current, "Add only supported static images. Animated/multi-frame images are rejected to avoid dropping frames.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Create PDF", callback_data="pdf:image_finish")]]))
                     return
             if detected.category == "unknown":
                 input_path.unlink(missing_ok=True)
-                await message.reply_text("That file type is not supported in this collection. Send another file or finish.")
+                await _collection_reply(context, message, current, "That file type is not supported in this collection. Send another file or finish.")
                 return
             if collection_mode == "merge_collect":
                 list_key, names_key = "merge_files", "merge_names"
@@ -227,13 +299,13 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 keyboard = [[InlineKeyboardButton("Create ZIP", callback_data="archive:create_finish:zip"), InlineKeyboardButton("Create TAR", callback_data="archive:create_finish:tar")], [InlineKeyboardButton("Create TAR.GZ", callback_data="archive:create_finish:tar.gz")]]
                 prompt = f"Added <code>{_html(original_name)}</code> to the archive ({count} files). Send more files or choose an output archive."
             keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel:current")])
-            await message.reply_text(prompt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            await _collection_reply(context, message, current, prompt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         if kind not in {"pdf", "image", "audio", "video", "document", "archive"}:
             raise ValueError("Unsupported file category")
         targets, metadata = _available_targets(detected, kind, input_path)
         session = {"path": str(input_path), "job_dir": str(job_dir), "name": original_name,
-                   "info": detected, "kind": kind, "metadata": metadata}
+                   "info": detected, "kind": kind, "metadata": metadata, "view": "file", "chat_id": message.chat_id}
         state.sessions[user.id] = session
         details = ["📁 <b>FILE RECEIVED</b>", "", f"Filename: <code>{_html(original_name)}</code>",
                    f"Format: {_html(file_format.upper())}", f"MIME: <code>{_html(detected.mime_type)}</code>",
@@ -288,7 +360,10 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             details += ["", "Select a conversion or tool:"]
         else:
             details += ["", "No conversion target is currently available for this file on this server."]
-        await message.reply_text("\n".join(details), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+        session["menu_text"] = "\n".join(details)
+        session["menu_markup"] = InlineKeyboardMarkup(buttons) if buttons else navigation_keyboard()
+        sent = await _reply(message, session["menu_text"], parse_mode="HTML", reply_markup=session["menu_markup"])
+        session["menu_message_id"] = sent.message_id
     except Exception as exc:
         if not is_collection_add:
             shutil.rmtree(job_dir, ignore_errors=True)
@@ -298,7 +373,10 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         message_text = "I couldn't process that file. It may be malformed, unsupported, or too large."
         if isinstance(exc, ValueError):
             message_text = "I couldn't process that file because it exceeded a configured limit or its type is not supported."
-        await message.reply_text(message_text)
+        if is_collection_add and current:
+            await _collection_reply(context, message, current, message_text)
+        else:
+            await _reply(message, message_text)
 
 
 def _run_conversion(kind: str, file_format: str, input_path: str, target: str, output_dir: str):
@@ -327,22 +405,22 @@ def _package_paths(paths: list[Path], output_dir: Path, name: str, root: Path | 
     return archive
 
 
+@typing_handler
 async def conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.get(user.id) if user else None
     if not session or not Path(session["path"]).is_file():
-        await query.edit_message_text("This file session has expired. Send the file again to continue.")
+        await query.edit_message_text("This file session has expired. Send the file again to continue.", reply_markup=InlineKeyboardMarkup([]))
         return
     target = query.data.partition(":")[2].lower()
     available, _ = _available_targets(session["info"], session["kind"], Path(session["path"]))
     if target not in available:
-        await query.edit_message_text("That conversion is unavailable or unsafe for this file on this server.")
+        await query.edit_message_text("That conversion is unavailable or unsafe for this file on this server.", reply_markup=InlineKeyboardMarkup([]))
         return
     job_id = f"{user.id}:{Path(session['job_dir']).name}"
     state.total_jobs += 1
     state.active_jobs.add(job_id)
-    await query.edit_message_text("⏳ Converting your file…")
+    await query.edit_message_text("⏳ Converting your file…", reply_markup=InlineKeyboardMarkup([]))
     semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
     try:
         async with semaphore:
@@ -365,13 +443,13 @@ async def conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif output_bytes > original_bytes:
             caption += "\nThe converted file is larger than the original."
         with send_path.open("rb") as payload:
-            await context.bot.send_document(chat_id=user.id, document=payload, filename=send_path.name, caption=caption, parse_mode="HTML")
+            await context.bot.send_document(chat_id=user.id, document=payload, filename=send_path.name, caption=caption, parse_mode="HTML", reply_markup=navigation_keyboard())
         state.successful_jobs += 1
-        await query.message.reply_text("Ready for another file? Send one or use /start.")
+        await delete_message(context.bot, query.message.chat_id, query.message.message_id)
     except asyncio.TimeoutError:
         LOG.warning("Conversion timed out for %s", job_id)
         state.failed_jobs += 1
-        await query.message.reply_text("This conversion exceeded the time limit. Please try a smaller file or another format.")
+        await query.edit_message_text("This conversion exceeded the time limit. Please try a smaller file or another format.", reply_markup=InlineKeyboardMarkup([]))
     except Exception as exc:
         LOG.exception("Conversion failed for %s", job_id)
         state.failed_jobs += 1
@@ -381,38 +459,44 @@ async def conversion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             friendly = str(exc)
         else:
             friendly = "The file may be damaged, unsupported, or require a conversion tool that is unavailable."
-        await query.message.reply_text(f"Conversion failed: {_html(friendly)}", parse_mode="HTML")
+        await query.edit_message_text(f"Conversion failed: {_html(friendly)}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
     finally:
         state.active_jobs.discard(job_id)
         shutil.rmtree(session["job_dir"], ignore_errors=True)
         state.sessions.pop(user.id, None)
 
 
+@typing_handler
 async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.get(user.id) if user else None
     if not session:
-        await query.edit_message_text("This PDF session expired. Send the PDF again.")
+        await query.edit_message_text("This PDF session expired. Send the PDF again.", reply_markup=InlineKeyboardMarkup([]))
         return
     action = query.data.partition(":")[2]
+
     if action == "image_create":
         if session.get("kind") != "image" or session.get("metadata", {}).get("animated"):
-            await query.edit_message_text("Only static images can be combined into a PDF without losing animation frames.")
+            await query.edit_message_text("Only static images can be combined into a PDF without losing animation frames.", reply_markup=InlineKeyboardMarkup([]))
             return
-        session["mode"] = "image_pdf_collect"
+        session["mode"] = session["view"] = "image_pdf_collect"
         session["image_files"] = [session["path"]]
         session["image_names"] = [session["name"]]
-        await query.edit_message_text("Send additional static images. When ready, choose Create PDF.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Create PDF", callback_data="pdf:image_finish")], [InlineKeyboardButton("Cancel", callback_data="cancel:current")]]))
+        await query.edit_message_text(
+            "Send additional static images. When ready, choose Create PDF.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Create PDF", callback_data="pdf:image_finish")], [InlineKeyboardButton("Cancel", callback_data="cancel:current")]]),
+        )
+        session["collection_prompt_message_id"] = query.message.message_id
         return
+
     if action == "image_finish":
         if session.get("mode") != "image_pdf_collect":
-            await query.edit_message_text("This image-to-PDF collection is not active.")
+            await query.edit_message_text("This image-to-PDF collection is not active.", reply_markup=InlineKeyboardMarkup([]))
             return
         job_id = f"{user.id}:{Path(session['job_dir']).name}"
         state.total_jobs += 1
         state.active_jobs.add(job_id)
-        await query.edit_message_text("⏳ Combining images into a PDF…")
+        await query.edit_message_text("⏳ Combining images into a PDF…", reply_markup=InlineKeyboardMarkup([]))
         try:
             semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
             async with semaphore:
@@ -423,20 +507,25 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if result.stat().st_size > settings.max_output_mb * 1024 * 1024:
                 raise ValueError("output exceeds configured size limit")
             with result.open("rb") as payload:
-                await context.bot.send_document(user.id, payload, filename=result.name, caption=f"✅ Created a PDF from {len(session['image_files'])} image(s).")
+                await context.bot.send_document(user.id, payload, filename=result.name,
+                    caption=f"✅ Created a PDF from {len(session['image_files'])} image(s).",
+                    reply_markup=navigation_keyboard())
             state.successful_jobs += 1
+            await delete_message(context.bot, query.message.chat_id, query.message.message_id)
         except Exception:
             state.failed_jobs += 1
             LOG.exception("Image-to-PDF conversion failed")
-            await query.message.reply_text("Image-to-PDF conversion failed. Check that all images are valid and within limits.")
+            await query.edit_message_text("Image-to-PDF conversion failed. Check that all images are valid and within limits.", reply_markup=InlineKeyboardMarkup([]))
         finally:
             state.active_jobs.discard(job_id)
             shutil.rmtree(session["job_dir"], ignore_errors=True)
             state.sessions.pop(user.id, None)
         return
+
     if session.get("kind") != "pdf":
-        await query.edit_message_text("This PDF operation is not available for the current file.")
+        await query.edit_message_text("This PDF operation is not available for the current file.", reply_markup=InlineKeyboardMarkup([]))
         return
+
     if action == "info":
         try:
             metadata = await asyncio.to_thread(pdf_converter.info, session["path"])
@@ -444,20 +533,35 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             text = f"<b>PDF INFORMATION</b>\nPages: {metadata.get('pages', 'unknown')}\nEncrypted: {'Yes' if metadata.get('encrypted') else 'No'}"
             if first_page:
                 text += f"\nFirst page: {first_page.get('width')} × {first_page.get('height')} pt"
+            session["view"] = "pdf_info"
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ File options", callback_data="pdf:back")]]))
         except Exception:
-            await query.edit_message_text("PDF information could not be read. The file may be encrypted or damaged.")
-    elif action == "back":
-        await query.edit_message_text("Choose an operation for this PDF:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("PDF Info", callback_data="pdf:info"), InlineKeyboardButton("Split Pages", callback_data="pdf:split")],[InlineKeyboardButton("Merge with other PDFs", callback_data="pdf:merge")],[InlineKeyboardButton("Cancel", callback_data="cancel:current")]]))
-    elif action == "split":
-        session["mode"] = "split_wait"
-        await query.edit_message_text("Send page numbers or ranges, for example: <code>1-3, 5, 7-9</code>. Pages are 1-based. Send /cancel to stop.", parse_mode="HTML")
-    elif action == "merge":
-        session["mode"] = "merge_collect"
+            await query.edit_message_text("PDF information could not be read. The file may be encrypted or damaged.", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    if action == "back":
+        await _show_file_menu(query, context, session)
+        return
+
+    if action == "split":
+        session["mode"] = session["view"] = "split_wait"
+        session["prompt_message_id"] = query.message.message_id
+        await query.edit_message_text(
+            "Send page numbers or ranges, for example: <code>1-3, 5, 7-9</code>. Pages are 1-based. Tap Back to return.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    if action == "merge":
+        session["mode"] = session["view"] = "merge_collect"
         session["merge_files"] = [session["path"]]
         session["merge_names"] = [session["name"]]
-        await query.edit_message_text("Send one or more additional PDF files. Each file is signature-checked. When finished, tap Finish merge.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Finish merge", callback_data="pdf:merge_finish")],[InlineKeyboardButton("Cancel", callback_data="cancel:current")]]))
-    elif action == "merge_finish":
+        await query.edit_message_text(
+            "Send one or more additional PDF files. Each file is signature-checked. When finished, tap Finish merge.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Finish merge", callback_data="pdf:merge_finish")], [InlineKeyboardButton("Cancel", callback_data="cancel:current")]]))
+        session["collection_prompt_message_id"] = query.message.message_id
+        return
+
+    if action == "merge_finish":
         paths = [Path(p) for p in session.get("merge_files", [])]
         if len(paths) < 2:
             await query.edit_message_text("Add at least one more PDF before finishing.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel:current")]]))
@@ -465,7 +569,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         job_id = f"{user.id}:{Path(session['job_dir']).name}"
         state.total_jobs += 1
         state.active_jobs.add(job_id)
-        await query.edit_message_text("⏳ Merging PDFs…")
+        await query.edit_message_text("⏳ Merging PDFs…", reply_markup=InlineKeyboardMarkup([]))
         try:
             semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
             async with semaphore:
@@ -473,27 +577,28 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if result.stat().st_size > settings.max_output_mb * 1024 * 1024:
                 raise ValueError("output exceeds configured limit")
             with result.open("rb") as payload:
-                await context.bot.send_document(user.id, payload, filename=result.name, caption="✅ PDF merge completed.")
+                await context.bot.send_document(user.id, payload, filename=result.name,
+                    caption="✅ PDF merge completed.", reply_markup=navigation_keyboard())
             state.successful_jobs += 1
-            await query.message.reply_text("Ready for another file? Send one or use /start.")
-        except Exception as exc:
+            await delete_message(context.bot, query.message.chat_id, query.message.message_id)
+        except Exception:
             state.failed_jobs += 1
             LOG.exception("PDF merge failed")
-            await query.message.reply_text("PDF merge failed. The files may be encrypted, damaged, or over a configured limit.")
+            await query.edit_message_text("PDF merge failed. The files may be encrypted, damaged, or over a configured limit.", reply_markup=InlineKeyboardMarkup([]))
         finally:
             state.active_jobs.discard(job_id)
             shutil.rmtree(session["job_dir"], ignore_errors=True)
             state.sessions.pop(user.id, None)
 
-
+@typing_handler
 async def compression_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.get(user.id) if user else None
     if not session or not Path(session["path"]).is_file():
-        await query.edit_message_text("This file session expired. Send the file again.")
+        await query.edit_message_text("This file session expired. Send the file again.", reply_markup=InlineKeyboardMarkup([]))
         return
     if query.data == "compress:pick":
+        session["view"] = "compress_pick"
         await query.edit_message_text("Choose a compression profile. Results vary by file; compression may increase file size.", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Low (smaller file)", callback_data="compress:run:low")],
             [InlineKeyboardButton("Balanced", callback_data="compress:run:medium")],
@@ -503,12 +608,12 @@ async def compression_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     quality = query.data.rpartition(":")[2]
     if quality not in {"low", "medium", "high"}:
-        await query.edit_message_text("Invalid compression profile.")
+        await query.edit_message_text("Invalid compression profile.", reply_markup=InlineKeyboardMarkup([]))
         return
     job_id = f"{user.id}:{Path(session['job_dir']).name}"
     state.total_jobs += 1
     state.active_jobs.add(job_id)
-    await query.edit_message_text("⏳ Compressing your file…")
+    await query.edit_message_text("⏳ Compressing your file…", reply_markup=InlineKeyboardMarkup([]))
     try:
         semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
         async with semaphore:
@@ -524,8 +629,9 @@ async def compression_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             caption += "\nThe converted file is not smaller than the original."
         with result.open("rb") as payload:
-            await context.bot.send_document(user.id, payload, filename=result.name, caption=caption, parse_mode="HTML")
+            await context.bot.send_document(user.id, payload, filename=result.name, caption=caption, parse_mode="HTML", reply_markup=navigation_keyboard())
         state.successful_jobs += 1
+        await delete_message(context.bot, query.message.chat_id, query.message.message_id)
     except Exception as exc:
         state.failed_jobs += 1
         LOG.exception("Compression failed for %s", job_id)
@@ -535,7 +641,7 @@ async def compression_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             note = str(exc)
         else:
             note = "The file could not be compressed within the configured limits."
-        await query.message.reply_text(_html(note))
+        await query.edit_message_text(_html(note), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
     finally:
         state.active_jobs.discard(job_id)
         shutil.rmtree(session["job_dir"], ignore_errors=True)
@@ -561,16 +667,16 @@ def _run_compression(session: dict, quality: str) -> Path:
     raise ConversionError("Compression is not supported for this file")
 
 
+@typing_handler
 async def archive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.get(user.id) if user else None
     if not session or not Path(session.get("path", "")).is_file():
-        await query.edit_message_text("This file session expired. Send the file again.")
+        await query.edit_message_text("This file session expired. Send the file again.", reply_markup=InlineKeyboardMarkup([]))
         return
     action = query.data.partition(":")[2]
     if action == "create":
-        session["mode"] = "zip_collect"
+        session["mode"] = session["view"] = "zip_collect"
         session["zip_files"] = [session["path"]]
         session["zip_names"] = [session["name"]]
         await query.edit_message_text("Send any additional supported files to include. Choose ZIP, TAR, or TAR.GZ when ready.", reply_markup=InlineKeyboardMarkup([
@@ -578,13 +684,14 @@ async def archive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             [InlineKeyboardButton("Create TAR.GZ", callback_data="archive:create_finish:tar.gz")],
             [InlineKeyboardButton("Cancel", callback_data="cancel:current")],
         ]))
+        session["collection_prompt_message_id"] = query.message.message_id
         return
     if action.startswith("create_finish:"):
         fmt = action.partition(":")[2]
         if session.get("mode") != "zip_collect" or fmt not in {"zip", "tar", "tar.gz"}:
-            await query.edit_message_text("This archive creation session is not active.")
+            await query.edit_message_text("This archive creation session is not active.", reply_markup=InlineKeyboardMarkup([]))
             return
-        await query.edit_message_text(f"⏳ Creating {fmt.upper()} archive…")
+        await query.edit_message_text(f"⏳ Creating {fmt.upper()} archive…", reply_markup=InlineKeyboardMarkup([]))
         job_id = f"{user.id}:{Path(session['job_dir']).name}"
         state.total_jobs += 1
         state.active_jobs.add(job_id)
@@ -598,21 +705,22 @@ async def archive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if result.stat().st_size > settings.max_output_mb * 1024 * 1024:
                 raise ValueError("output exceeds configured size limit")
             with result.open("rb") as payload:
-                await context.bot.send_document(user.id, payload, filename=result.name, caption=f"✅ {fmt.upper()} archive created with {len(session['zip_files'])} file(s).")
+                await context.bot.send_document(user.id, payload, filename=result.name, caption=f"✅ {fmt.upper()} archive created with {len(session['zip_files'])} file(s).", reply_markup=navigation_keyboard())
             state.successful_jobs += 1
+            await delete_message(context.bot, query.message.chat_id, query.message.message_id)
         except Exception:
             state.failed_jobs += 1
             LOG.exception("Archive creation failed")
-            await query.message.reply_text("Archive creation failed. The files may exceed configured count, size, or output limits.")
+            await query.edit_message_text("Archive creation failed. The files may exceed configured count, size, or output limits.", reply_markup=InlineKeyboardMarkup([]))
         finally:
             state.active_jobs.discard(job_id)
             shutil.rmtree(session["job_dir"], ignore_errors=True)
             state.sessions.pop(user.id, None)
         return
     if session.get("kind") != "archive":
-        await query.edit_message_text("This file is not a supported archive.")
+        await query.edit_message_text("This file is not a supported archive.", reply_markup=InlineKeyboardMarkup([]))
         return
-    await query.edit_message_text("⏳ Safely extracting archive contents…")
+    await query.edit_message_text("⏳ Safely extracting archive contents…", reply_markup=InlineKeyboardMarkup([]))
     job_id = f"{user.id}:{Path(session['job_dir']).name}"
     state.total_jobs += 1
     state.active_jobs.add(job_id)
@@ -631,18 +739,26 @@ async def archive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if bundle.stat().st_size > settings.max_output_mb * 1024 * 1024:
             raise ValueError("output exceeds configured size limit")
         with bundle.open("rb") as payload:
-            await context.bot.send_document(user.id, payload, filename=bundle.name, caption=f"✅ Extracted {len(files)} file(s) into a ZIP bundle. Unsafe paths and links are rejected.")
+            await context.bot.send_document(user.id, payload, filename=bundle.name, caption=f"✅ Extracted {len(files)} file(s) into a ZIP bundle. Unsafe paths and links are rejected.", reply_markup=navigation_keyboard())
         state.successful_jobs += 1
+        await delete_message(context.bot, query.message.chat_id, query.message.message_id)
     except Exception as exc:
         state.failed_jobs += 1
         LOG.info("Archive extraction rejected/failed: %s", type(exc).__name__)
-        await query.message.reply_text("Archive extraction failed. It may be malformed, unsafe, or exceed the configured extraction limits.")
+        await query.edit_message_text("Archive extraction failed. It may be malformed, unsafe, or exceed the configured extraction limits.", reply_markup=InlineKeyboardMarkup([]))
     finally:
         state.active_jobs.discard(job_id)
         shutil.rmtree(session["job_dir"], ignore_errors=True)
         state.sessions.pop(user.id, None)
 
 
+def _should_type_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    session = state.sessions.get(user.id) if user else None
+    return bool(session and session.get("mode") in {"split_wait", "image_resize_wait"})
+
+
+@typing_handler(should_type=_should_type_text)
 async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user, message = update.effective_user, update.effective_message
     if not user or not message or not message.text:
@@ -650,91 +766,125 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session = state.sessions.get(user.id)
     if not session or session.get("mode") not in {"split_wait", "image_resize_wait"}:
         return
-    pages = message.text.strip()
-    if pages.lower() == "/cancel":
+    value = message.text.strip()
+    if value.lower() == "/cancel":
+        await _clear_tracked_prompts(context, session, session.get("chat_id", user.id))
         shutil.rmtree(session["job_dir"], ignore_errors=True)
         state.sessions.pop(user.id, None)
-        await message.reply_text("PDF split cancelled and temporary files removed.")
+        await _reply(message, "Cancelled. Temporary files were removed.")
         return
-    if session.get("mode") == "image_resize_wait":
+
+    resizing = session.get("mode") == "image_resize_wait"
+    if resizing:
         import re
-        match = re.fullmatch(r"\s*(\d{1,5})\s*(?:x|,|\s)\s*(\d{1,5})\s*", pages, flags=re.IGNORECASE)
+        match = re.fullmatch(r"\s*(\d{1,5})\s*(?:x|,|\s)\s*(\d{1,5})\s*", value, flags=re.IGNORECASE)
         if not match:
-            await message.reply_text("Enter dimensions like <code>800x600</code>, or send /cancel.", parse_mode="HTML")
+            await _edit_prompt(context, user.id, session, "Enter dimensions like <code>800x600</code>, or tap Back to return.", "HTML")
             return
         width, height = (int(match.group(1)), int(match.group(2)))
         if not (1 <= width <= 12000 and 1 <= height <= 12000 and width * height <= settings.max_image_pixels):
-            await message.reply_text(f"Dimensions must be 1–12000 px per side and no more than {settings.max_image_pixels:,} output pixels.")
+            await _edit_prompt(context, user.id, session,
+                f"Dimensions must be 1–12000 px per side and no more than {settings.max_image_pixels:,} output pixels. Try again or tap Back.")
             return
-        job_id = f"{user.id}:{Path(session['job_dir']).name}"
-        state.total_jobs += 1
-        state.active_jobs.add(job_id)
-        await message.reply_text("⏳ Resizing image…")
-        try:
-            fmt = _info_value(session["info"], "format", "png")
-            semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
-            async with semaphore:
-                output = await asyncio.wait_for(asyncio.to_thread(
-                    image_converter.convert, session["path"], fmt, session["job_dir"],
-                    resize=(width, height), max_pixels=settings.max_image_pixels), timeout=settings.job_timeout_seconds)
-            output = Path(output)
-            if output.stat().st_size > settings.max_output_mb * 1024 * 1024:
-                raise ValueError("output exceeds configured size limit")
-            with output.open("rb") as payload:
-                await context.bot.send_document(user.id, payload, filename=output.name, caption=f"✅ Image resized within {width} × {height} px, preserving aspect ratio.")
-            state.successful_jobs += 1
-        except Exception:
-            state.failed_jobs += 1
-            LOG.exception("Image resizing failed")
-            await message.reply_text("Image resizing failed. The image may be damaged or exceed configured limits.")
-        finally:
-            state.active_jobs.discard(job_id)
-            shutil.rmtree(session["job_dir"], ignore_errors=True)
-            state.sessions.pop(user.id, None)
-        return
+
     job_id = f"{user.id}:{Path(session['job_dir']).name}"
     state.total_jobs += 1
     state.active_jobs.add(job_id)
-    await message.reply_text("⏳ Splitting PDF pages…")
+    progress_id = await _edit_prompt(context, user.id, session,
+                                     "⏳ Resizing image…" if resizing else "⏳ Splitting PDF pages…")
     try:
         semaphore = state.semaphore or asyncio.Semaphore(settings.max_concurrent_jobs)
         async with semaphore:
-            outputs = await asyncio.wait_for(asyncio.to_thread(pdf_converter.split_pdf, session["path"], session["job_dir"], pages), timeout=settings.job_timeout_seconds)
-        if any(p.stat().st_size > settings.max_output_mb * 1024 * 1024 for p in outputs):
-            raise ValueError("output exceeds configured limit")
-        bundle = _package_paths([Path(p) for p in outputs], Path(session["job_dir"]), "split_pages.zip")
-        if bundle.stat().st_size > settings.max_output_mb * 1024 * 1024:
-            raise ValueError("output exceeds configured limit")
-        with bundle.open("rb") as payload:
-            await context.bot.send_document(user.id, payload, filename=bundle.name, caption=f"✅ Split {len(outputs)} PDF page(s) into separate files.")
+            if resizing:
+                fmt = _info_value(session["info"], "format", "png")
+                output = await asyncio.wait_for(asyncio.to_thread(
+                    image_converter.convert, session["path"], fmt, session["job_dir"],
+                    resize=(width, height), max_pixels=settings.max_image_pixels), timeout=settings.job_timeout_seconds)
+                output = Path(output)
+                if output.stat().st_size > settings.max_output_mb * 1024 * 1024:
+                    raise ValueError("output exceeds configured size limit")
+                filename = output.name
+                caption = f"✅ Image resized within {width} × {height} px, preserving aspect ratio."
+            else:
+                outputs = await asyncio.wait_for(asyncio.to_thread(
+                    pdf_converter.split_pdf, session["path"], session["job_dir"], value), timeout=settings.job_timeout_seconds)
+                if any(path.stat().st_size > settings.max_output_mb * 1024 * 1024 for path in outputs):
+                    raise ValueError("output exceeds configured limit")
+                output = _package_paths([Path(path) for path in outputs], Path(session["job_dir"]), "split_pages.zip")
+                if output.stat().st_size > settings.max_output_mb * 1024 * 1024:
+                    raise ValueError("output exceeds configured limit")
+                filename = output.name
+                caption = f"✅ Split {len(outputs)} PDF page(s) into separate files."
+        with output.open("rb") as payload:
+            await context.bot.send_document(user.id, payload, filename=filename, caption=caption,
+                                            reply_markup=navigation_keyboard())
         state.successful_jobs += 1
+        await delete_message(context.bot, user.id, progress_id)
     except Exception as exc:
         state.failed_jobs += 1
-        LOG.info("PDF split rejected/failed: %s", type(exc).__name__)
-        await message.reply_text("PDF splitting failed. Check that the page range is valid and the PDF is not encrypted or damaged.")
+        LOG.info("Text-input conversion rejected/failed: %s", type(exc).__name__)
+        note = ("Image resizing failed. The image may be damaged or exceed configured limits." if resizing
+                else "PDF splitting failed. Check that the page range is valid and the PDF is not encrypted or damaged.")
+        await _edit_prompt(context, user.id, session, note)
         state.active_jobs.discard(job_id)
         return
     finally:
         state.active_jobs.discard(job_id)
+    session.pop("prompt_message_id", None)
     shutil.rmtree(session["job_dir"], ignore_errors=True)
     state.sessions.pop(user.id, None)
 
-
+@typing_handler
 async def resize_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.get(user.id) if user else None
     if not session or session.get("kind") != "image":
-        await query.edit_message_text("This image session expired. Send an image again.")
+        await query.edit_message_text("This image session expired. Send an image again.", reply_markup=InlineKeyboardMarkup([]))
         return
-    session["mode"] = "image_resize_wait"
-    await query.edit_message_text("Send the maximum width and height, for example <code>800x600</code>. The aspect ratio is preserved. Send /cancel to stop.", parse_mode="HTML")
+    session["mode"] = session["view"] = "image_resize_wait"
+    session["prompt_message_id"] = query.message.message_id
+    await query.edit_message_text("Send the maximum width and height, for example <code>800x600</code>. The aspect ratio is preserved. Tap Back to return.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
 
 
+@typing_handler
+async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query, user = update.callback_query, update.effective_user
+    session = state.sessions.get(user.id) if user else None
+    if not session:
+        await _edit_or_replace(query, context, WELCOME, main_keyboard(), "HTML")
+        return
+
+    view = session.get("view", "file")
+    if view == "file":
+        await _edit_or_replace(query, context, WELCOME, main_keyboard(), "HTML")
+        return
+
+    collection_keys = {
+        "merge_collect": ("merge_files", "merge_names"),
+        "zip_collect": ("zip_files", "zip_names"),
+        "image_pdf_collect": ("image_files", "image_names"),
+    }
+    if view in collection_keys:
+        paths_key, names_key = collection_keys[view]
+        paths = session.get(paths_key, [])
+        names = session.get(names_key, [])
+        for path in paths[1:]:
+            if path != session.get("path"):
+                Path(path).unlink(missing_ok=True)
+        session[paths_key] = paths[:1]
+        session[names_key] = names[:1]
+    await _show_file_menu(query, context, session)
+
+
+@typing_handler
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user = update.callback_query, update.effective_user
-    await query.answer()
     session = state.sessions.pop(user.id, None) if user else None
     if session:
+        keep_id = query.message.message_id if query.message else None
+        for key in ("prompt_message_id", "collection_prompt_message_id", "menu_message_id"):
+            message_id = session.pop(key, None)
+            if message_id != keep_id:
+                await delete_message(context.bot, query.message.chat_id if query.message else user.id, message_id)
         shutil.rmtree(session.get("job_dir", ""), ignore_errors=True)
-    await query.edit_message_text("Cancelled. Your temporary files have been removed.")
+    await query.edit_message_text("Cancelled. Temporary files were removed.", reply_markup=InlineKeyboardMarkup([]))

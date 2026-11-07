@@ -7,25 +7,28 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from config import settings
 from runtime import state
+from utils.chat_ui import navigation_keyboard, reply_with_navigation, typing_handler
 
 
 def _is_admin(update: Update) -> bool:
     return bool(settings.admin_id and update.effective_user and update.effective_user.id == settings.admin_id)
 
 
+@typing_handler
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
-        await update.effective_message.reply_text("This command is for authorized administrators only.")
+        await reply_with_navigation(update.effective_message, "This command is for authorized administrators only.")
         return
-    await update.effective_message.reply_text("ZENFILE Admin\n/stats — runtime statistics\n/status — process diagnostics\n/broadcast <message> — message users seen in this process")
+    await reply_with_navigation(update.effective_message, "ZENFILE Admin\n/stats — runtime statistics\n/status — process diagnostics\n/broadcast <message> — message users seen in this process")
 
 
+@typing_handler
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
-        await update.effective_message.reply_text("This command is for authorized administrators only.")
+        await reply_with_navigation(update.effective_message, "This command is for authorized administrators only.")
         return
     elapsed = int(time.time() - state.started_at)
-    await update.effective_message.reply_text(
+    await reply_with_navigation(update.effective_message,
         "Runtime statistics (reset on restart)\n"
         f"Uptime: {elapsed // 3600}h {(elapsed % 3600) // 60}m\n"
         f"Users seen: {len(state.seen_users)}\nJobs total: {state.total_jobs}\n"
@@ -33,9 +36,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+@typing_handler
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
-        await update.effective_message.reply_text("This command is for authorized administrators only.")
+        await reply_with_navigation(update.effective_message, "This command is for authorized administrators only.")
         return
     try:
         process = psutil.Process(os.getpid())
@@ -46,23 +50,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                    f"Process RSS: {rss_mb:.1f} MB\nActive jobs: {len(state.active_jobs)}")
     except Exception:
         details = "Resource metrics are unavailable on this host."
-    await update.effective_message.reply_text("ZENFILE status\n" + details)
+    await reply_with_navigation(update.effective_message, "ZENFILE status\n" + details)
 
 
+@typing_handler
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
-        await update.effective_message.reply_text("This command is for authorized administrators only.")
+        await reply_with_navigation(update.effective_message, "This command is for authorized administrators only.")
         return
     message = " ".join(context.args).strip()
     if not message:
-        await update.effective_message.reply_text("Usage: /broadcast <message>")
+        await reply_with_navigation(update.effective_message, "Usage: /broadcast <message>")
         return
     user_ids = list(state.seen_users)
     sent = failed = 0
     for uid in user_ids:
         try:
-            await context.bot.send_message(uid, message)
+            await context.bot.send_message(uid, message, reply_markup=navigation_keyboard())
             sent += 1
         except Exception:
             failed += 1
-    await update.effective_message.reply_text(f"Broadcast finished. Sent: {sent}; unavailable/failed: {failed}. Only users seen since this process started were included.")
+    await reply_with_navigation(update.effective_message, f"Broadcast finished. Sent: {sent}; unavailable/failed: {failed}. Only users seen since this process started were included.")
