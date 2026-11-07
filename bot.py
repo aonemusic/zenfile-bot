@@ -31,7 +31,7 @@ def check_dependencies() -> None:
     except ImportError:
         LOG.warning("Pillow unavailable; image conversion disabled")
     try:
-        import fitz  # noqa: F401
+        import pymupdf  # noqa: F401
         LOG.info("PyMuPDF available")
     except ImportError:
         LOG.warning("PyMuPDF unavailable; PDF page rendering disabled")
@@ -78,6 +78,10 @@ def build_application() -> Application:
 def main() -> None:
     logging.basicConfig(level=getattr(logging, __import__("os").getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx INFO logs include the full Telegram API URL, whose path contains BOT_TOKEN.
+    # Keep request URLs out of Render logs while retaining warnings and errors.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if not settings.bot_token:
         LOG.error("BOT_TOKEN is required. Copy .env.example to .env and set it, or configure it in your hosting environment.")
         sys.exit(2)

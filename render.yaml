@@ -1,10 +1,10 @@
-# Render Blueprint: Docker background worker using Telegram polling.
-# Set BOT_TOKEN as a secret in the Render dashboard after creating the service.
+# Render Blueprint: Docker Web Service using Telegram webhooks.
+# Set BOT_TOKEN and WEBHOOK_SECRET as private values in Render.
 services:
-  - type: worker
+  - type: web
     name: zenfile-bot
     runtime: docker
-    plan: starter
+    plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
     envVars:
@@ -31,4 +31,8 @@ services:
       - key: LOG_LEVEL
         value: INFO
       - key: BOT_MODE
-        value: polling
+        value: webhook
+      - key: WEBHOOK_PATH
+        value: zenfile-webhook
+      - key: WEBHOOK_SECRET
+        sync: false

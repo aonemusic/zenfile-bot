@@ -56,7 +56,7 @@ For local development, copy `.env.example` to `.env` and fill in the token. The 
 | `TEMP_DIR` | No | `/tmp/zenfile` | Directory for temporary uploads, conversion intermediates, and outputs. |
 | `LOG_LEVEL` | No | `INFO` | Python logging level, such as `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Avoid logging tokens or private file contents. |
 | `BOT_MODE` | No | `polling` | `polling` or `webhook`. Polling is the default. |
-| `WEBHOOK_URL` | For webhook | empty | Public HTTPS base URL for webhook mode. |
+| `WEBHOOK_URL` | For webhook outside Render | empty | Public HTTPS base URL. On Render, the app falls back to `RENDER_EXTERNAL_URL` if this is unset. |
 | `WEBHOOK_PATH` | No | `zenfile-webhook` | Webhook request path, without a leading slash in the setting. |
 | `WEBHOOK_SECRET` | Recommended for webhook | empty | Optional Telegram webhook secret token; configure it as a secret when using webhook mode. |
 | `PORT` | No | `10000` | HTTP listener port when webhook mode is configured. Polling workers do not need an inbound port. |
@@ -128,7 +128,7 @@ The container runs as a non-root user and is intended for one bot process. Tempo
 
 ## Deployment
 
-- [Render deployment](docs/deploy-render.md) — Docker background worker configured for polling.
+- [Render deployment](docs/deploy-render.md) — Docker Web Service configured for Telegram webhooks.
 - [Koyeb deployment](docs/deploy-koyeb.md) — Docker worker/service instructions and environment setup.
 
 A continuously running worker may incur hosting charges. Free hosting tiers can sleep, pause, or scale to zero, and their resource limits vary; they do **not** guarantee 24/7 bot availability. Sleeping/restarting services can delay update handling or interrupt conversion jobs. Confirm current plan behavior, quotas, persistence, and pricing directly with the provider before deployment.
@@ -181,6 +181,7 @@ A continuously running worker may incur hosting charges. Free hosting tiers can 
 │   ├── test_security.py
 │   ├── test_cleanup.py
 │   ├── test_admin.py
+│   ├── test_sessions.py
 │   └── test_bot_ui.py
 ├── .dockerignore
 ├── .env.example

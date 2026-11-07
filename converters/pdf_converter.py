@@ -23,9 +23,15 @@ MAX_PDF_PAGES = settings.max_pdf_pages
 
 
 def _fitz():
-    try: import fitz
-    except ImportError as exc: raise DependencyUnavailableError("PyMuPDF is required for this PDF operation") from exc
-    return fitz
+    try:
+        import pymupdf
+        return pymupdf
+    except ImportError:
+        try:
+            import fitz
+            return fitz
+        except ImportError as exc:
+            raise DependencyUnavailableError("PyMuPDF is required for PDF rendering") from exc
 
 
 def _pypdf():

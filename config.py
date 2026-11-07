@@ -39,7 +39,7 @@ class Settings:
     job_timeout_seconds: int = _int_env("JOB_TIMEOUT_SECONDS", 300)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "/tmp/zenfile"))
     mode: str = os.getenv("BOT_MODE", "polling").lower().strip()
-    webhook_url: str = os.getenv("WEBHOOK_URL", "").strip()
+    webhook_url: str = os.getenv("WEBHOOK_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
     webhook_path: str = os.getenv("WEBHOOK_PATH", "zenfile-webhook").strip("/")
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "").strip()
     webhook_port: int = _int_env("PORT", 10000)

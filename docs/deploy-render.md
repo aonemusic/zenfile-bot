@@ -1,6 +1,6 @@
 # Deploy ZENFILE on Render
 
-The included [`render.yaml`](../render.yaml) describes a Docker background worker intended for one Telegram bot process using polling. It does not create a webhook endpoint. Local unit/conversion tests have been run, but the project has not been built or deployed on Render; review the current implementation and provider settings before release.
+The included [`render.yaml`](../render.yaml) describes a Docker Web Service using Telegram webhooks. It binds to Render's injected `PORT`; the app uses `RENDER_EXTERNAL_URL` as the webhook base URL if `WEBHOOK_URL` is unset. Local unit/conversion tests have been run, but the image and webhook deployment must still be validated in Render.
 
 ## 1. Prepare the GitHub repository
 
@@ -24,11 +24,11 @@ The included [`render.yaml`](../render.yaml) describes a Docker background worke
 ## 2. Create the Render service
 
 1. Sign in to Render and connect the GitHub account/repository containing ZENFILE.
-2. Create a Blueprint deployment from the repository and review the proposed service. The Blueprint defines a Docker **worker** using `Dockerfile`.
-3. The manifest sets `plan: starter` as an explicit worker configuration; it is not a free-tier promise. Review current Render prices, quotas, and availability before creating the service.
-4. Add `BOT_TOKEN` as a secret environment variable in the service settings. Set `ADMIN_ID` to one verified numeric Telegram user ID if you want to allow that administrator's admin commands. The current configuration expects one ID, not a username or comma-separated list; omit the setting or use `0` for no configured admin.
-5. Review the defaults: `MAX_INPUT_MB=18`, `MAX_OUTPUT_MB=49`, `MAX_CONCURRENT_JOBS=2`, and `JOB_TIMEOUT_SECONDS=300`. `BOT_MODE=polling` is explicit in the manifest.
-6. Start/redeploy the service and inspect its logs. Do not run a second active polling service against the same bot token.
+2. Create or update the Render service as a Docker **Web Service** using `Dockerfile`. The included Blueprint declares `type: web` and `plan: free` to match the intended setup; confirm the current price and free-tier limits in your account.
+3. Add `BOT_TOKEN` and `WEBHOOK_SECRET` as private environment variables. `WEBHOOK_URL` may be left unset because the app uses Render's `RENDER_EXTERNAL_URL`; set `WEBHOOK_PATH=zenfile-webhook` if it is not already configured.
+4. Set `BOT_MODE=webhook`. Keep Render's injected `PORT` unchanged; the app binds the Tornado webhook server to it. Set `ADMIN_ID` only to one verified numeric Telegram user ID if admin commands are needed.
+5. Review the defaults: `MAX_INPUT_MB=18`, `MAX_OUTPUT_MB=49`, `MAX_CONCURRENT_JOBS=2`, and `JOB_TIMEOUT_SECONDS=300`.
+6. Deploy and inspect build and application logs. Do not run polling and webhook delivery at once for the same token.
 
 ## 3. Set up BotFather and an admin ID
 
@@ -39,7 +39,7 @@ The included [`render.yaml`](../render.yaml) describes a Docker background worke
 
 ## Polling versus webhook
 
-The included service is a polling worker. `BOT_MODE=polling` is the configured default. Webhook mode requires setting `BOT_MODE=webhook`, a public HTTPS `WEBHOOK_URL`, a reachable HTTP service on the configured `PORT` and `WEBHOOK_PATH`, and a strong `WEBHOOK_SECRET`. This Blueprint is a worker and does not provide public webhook ingress; do not merely set the URL here and assume a handler is reachable. Use only one update-delivery mode per token.
+This Web Service must use `BOT_MODE=webhook`. It binds to Render's `PORT` and uses `WEBHOOK_URL` or `RENDER_EXTERNAL_URL` plus `WEBHOOK_PATH` to register the webhook with Telegram. Set a strong `WEBHOOK_SECRET`. Do not run a second polling process for the same bot token. Render's free Web Services may sleep when idle, so webhook delivery can experience cold-start delays; check the current plan behavior and costs before relying on uninterrupted availability.
 
 ## Operations and caveats
 

@@ -60,6 +60,14 @@ def _info_value(info, key, default=None):
     return info.get(key, default) if isinstance(info, dict) else getattr(info, key, default)
 
 
+def _collection_files(current: dict | None, mode: str | None) -> list[str]:
+    """Return collected input paths safely, including for a first upload."""
+    if not current or not mode:
+        return []
+    key = {"merge_collect": "merge_files", "zip_collect": "zip_files", "image_pdf_collect": "image_files"}.get(mode)
+    return current.get(key, []) if key else []
+
+
 def _converter_for(kind: str, file_format: str, target: str):
     if kind == "pdf" or (kind == "image" and target == "pdf"):
         return pdf_converter
@@ -91,10 +99,14 @@ def _dependency_available(kind: str, file_format: str, target: str) -> bool:
         return target in {"jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif", "gif"}
     if kind == "pdf":
         try:
-            import fitz  # noqa: F401
+            import pymupdf  # noqa: F401
             return target in {"png", "jpg", "jpeg", "txt"}
         except ImportError:
-            return False
+            try:
+                import fitz  # noqa: F401
+                return target in {"png", "jpg", "jpeg", "txt"}
+            except ImportError:
+                return False
     if kind in {"audio", "video"} or (kind == "image" and file_format == "gif" and target in {"mp4", "webm"}):
         return shutil.which("ffmpeg") is not None
     if kind == "document":
@@ -167,7 +179,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=settings.temp_dir))
     original_name = safe_filename(getattr(attachment, "file_name", "") or f"upload_{attachment.file_unique_id}")
     suffix = "".join(Path(original_name).suffixes)[-16:]
-    collection_list = current.get("merge_files", []) if is_merge_add else current.get("image_files", []) if collection_mode == "image_pdf_collect" else current.get("zip_files", [])
+    collection_list = _collection_files(current, collection_mode)
     input_path = job_dir / f"input_{len(collection_list) + 1 if is_collection_add else 1}{suffix}"
     try:
         tg_file = await context.bot.get_file(attachment.file_id)

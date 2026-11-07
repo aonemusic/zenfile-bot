@@ -47,7 +47,7 @@ This guide describes deploying the included Dockerfile from GitHub as a Telegram
 
 ## Polling and webhook notes
 
-Polling is the default. Webhook mode requires `BOT_MODE=webhook`, a public HTTPS `WEBHOOK_URL`, a reachable listener on `PORT`, correct routing for `WEBHOOK_PATH`, and a strong `WEBHOOK_SECRET`. Confirm the implementation and Koyeb service type support it before enabling. Do not activate both polling and webhook for one token. The Render Blueprint and this guide's default setup use polling.
+Polling is the local default. Webhook mode requires `BOT_MODE=webhook`, a public HTTPS `WEBHOOK_URL`, a reachable listener on `PORT`, correct routing for `WEBHOOK_PATH`, and a strong `WEBHOOK_SECRET`. Confirm the implementation and Koyeb service type support it before enabling. Do not activate both polling and webhook for one token. The Render Blueprint uses webhook mode; this Koyeb guide's default setup remains polling.
 
 ## Reliability, files, and cost
 
