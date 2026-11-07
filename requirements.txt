@@ -1,0 +1,9 @@
+# Python dependencies for the ZENFILE bot implementation (Python 3.11).
+# FFmpeg, LibreOffice, Poppler, and native runtime libraries are installed by
+# the Dockerfile or the host operating system; they are not pip packages.
+python-telegram-bot[webhooks]>=22.8,<23.0
+Pillow>=10.4,<13.0
+PyMuPDF>=1.24,<2.0
+pypdf>=5.0,<7.0
+psutil>=6.0,<8.0
+python-dotenv>=1.0,<2.0

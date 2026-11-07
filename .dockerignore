@@ -1,0 +1,21 @@
+# Keep credentials and local settings out of container build contexts.
+.env
+.env.*
+
+# Version control and local Python environments
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local logs, conversion scratch files, and editor artifacts
+*.log
+logs/
+.tmp/
+tmp/
+temp/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
